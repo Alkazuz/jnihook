@@ -603,35 +603,57 @@ JNIHook_Detach(jmethodID method)
 JNIHOOK_API jnihook_result_t JNIHOOK_CALL
 JNIHook_Shutdown()
 {
-	JNIEnv *env;
-	jvmtiEventCallbacks callbacks = {};
+    if (!g_jnihook) {
+        return JNIHOOK_OK;
+    }
 
-	if (g_jnihook->jvm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_8)) {
-		return JNIHOOK_ERR_GET_JNI;
-	}
+    JNIEnv* env;
+    jvmtiEventCallbacks callbacks = {};
 
-	for (auto &[key, _value] : g_class_file_cache) {
-		jclass clazz = env->FindClass(key.c_str());
+    if (g_jnihook->jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_8)) {
+        return JNIHOOK_ERR_GET_JNI;
+    }
 
-		g_hooks[key].clear();
+    jthread currentThread = nullptr;
+    jthread* threads = nullptr;
+    jint threadCount = 0;
 
-		if (!clazz)
-			continue;
+    if (g_jnihook->jvmti->GetCurrentThread(&currentThread) != JVMTI_ERROR_NONE) {
+        return JNIHOOK_ERR_JVMTI_OPERATION;
+    }
+    if (g_jnihook->jvmti->GetAllThreads(&threadCount, &threads) != JVMTI_ERROR_NONE) {
+        return JNIHOOK_ERR_JVMTI_OPERATION;
+    }
 
-		// Reapplying the class with empty hooks will just restore the original one.
-		ReapplyClass(clazz, key);
-	}
+    for (jint i = 0; i < threadCount; i++) {
+        if (!env->IsSameObject(threads[i], currentThread)) {
+            g_jnihook->jvmti->SuspendThread(threads[i]);
+        }
+    }
 
-	g_class_file_cache.clear();
+    for (auto& [className, _unusedCf] : g_class_file_cache) {
+        jclass clazz = env->FindClass(className.c_str());
+        g_hooks[className].clear();
 
-	// TODO: Fully cleanup defined classes in `g_original_classes` by deleting them from the JVM memory
-	//       (if possible without doing crazy hacks)
-	g_original_classes.clear();
+        if (clazz) {
+            ReapplyClass(clazz, className);
+        }
+    }
 
-	g_jnihook->jvmti->SetEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_CLASS_FILE_LOAD_HOOK, NULL);
-	g_jnihook->jvmti->SetEventCallbacks(&callbacks, sizeof(callbacks));
+    g_class_file_cache.clear();
+    g_original_classes.clear();
 
-	g_jnihook = nullptr;
+    g_jnihook->jvmti->SetEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_CLASS_FILE_LOAD_HOOK, NULL);
+    g_jnihook->jvmti->SetEventCallbacks(&callbacks, sizeof(callbacks));
 
-	return JNIHOOK_OK;
+    for (jint i = 0; i < threadCount; i++) {
+        if (!env->IsSameObject(threads[i], currentThread)) {
+            g_jnihook->jvmti->ResumeThread(threads[i]);
+        }
+    }
+    g_jnihook->jvmti->Deallocate(reinterpret_cast<unsigned char*>(threads));
+
+    g_jnihook = nullptr;
+
+    return JNIHOOK_OK;
 }
